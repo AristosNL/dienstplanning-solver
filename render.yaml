@@ -1,0 +1,6 @@
+services:
+  - type: web
+    name: dienstplanning-solver
+    runtime: docker
+    plan: free
+    healthCheckPath: /health

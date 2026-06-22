@@ -1,0 +1,7 @@
+FROM python:3.11-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY roster_engine.py app.py ./
+# Render/Cloud Run geven de poort via $PORT
+CMD uvicorn app:app --host 0.0.0.0 --port ${PORT:-8000}
