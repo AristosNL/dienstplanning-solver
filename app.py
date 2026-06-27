@@ -12,10 +12,12 @@ bedient later ook de dagplanning (ander endpoint, andere slots).
 CORS staat open zodat de React-site (localhost of Netlify) hem mag aanroepen.
 """
 
-from datetime import date, timedelta
-from fastapi import FastAPI
+from datetime import date, timedelta, datetime as dt
+from io import BytesIO
+from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+import openpyxl
 
 from roster_engine import RosterEngine, Staff, Slot, Period, Avail, SoftWeights
 
@@ -47,6 +49,82 @@ class SolveReq(BaseModel):
 @app.get("/health")
 def health():
     return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# /parse-requirements
+# Accepteert OK- en/of PBK-Excel (multipart), retourneert geldige PLA-slots.
+# Een PLA is geldig als: niet doorgestreept EN niet overgedragen ("PLA > X").
+# Structuur retour: { requirements: { "2026-01-05": { "AM": ["OK"], "PM": [] } } }
+# ---------------------------------------------------------------------------
+
+_DAYS_NL = {"MAANDAG", "DINSDAG", "WOENSDAG", "DONDERDAG", "VRIJDAG"}
+# Per dag-blok: (datum_kol, ochtend_kol, middag_kol) voor weken 1-4
+_WEEK_COLS = [(2, 2, 3), (4, 4, 5), (6, 6, 7), (8, 8, 9)]
+
+
+def _extract(content: bytes, kind: str, result: dict):
+    """Parseer één Excel-bestand en voeg geldige PLA-requirements toe aan result."""
+    wb_v = openpyxl.load_workbook(BytesIO(content), data_only=True)
+    wb_f = openpyxl.load_workbook(BytesIO(content), data_only=False)
+
+    for sheet in wb_v.sheetnames:
+        wsv = wb_v[sheet]
+        wsf = wb_f[sheet]
+
+        for r in range(1, wsv.max_row + 1):
+            a = wsv.cell(r, 1).value
+            if not (a and str(a).strip().upper() in _DAYS_NL):
+                continue
+
+            # Verzamel rijen onder dit dag-anker tot de volgende dag
+            block = []
+            rr = r + 1
+            while rr <= wsv.max_row:
+                nxt = wsv.cell(rr, 1).value
+                if nxt and str(nxt).strip().upper() in _DAYS_NL:
+                    break
+                block.append(rr)
+                rr += 1
+
+            for (dc, oc, mc) in _WEEK_COLS:
+                dval = wsv.cell(r, dc).value
+                if not isinstance(dval, dt):
+                    continue
+                date_str = dval.strftime("%Y-%m-%d")
+
+                for (col, period) in [(oc, "AM"), (mc, "PM")]:
+                    for br in block:
+                        v = wsv.cell(br, col).value
+                        if not (v and "PLA" in str(v).upper()):
+                            continue
+                        cell_f = wsf.cell(br, col)
+                        struck = bool(cell_f.font and cell_f.font.strikethrough)
+                        transfer = ">" in str(v)   # "PLA > NCH" = overgedragen
+                        if struck or transfer:
+                            continue
+                        # Geldige requirement — voeg toe (dedupliceer)
+                        slot = result.setdefault(date_str, {"AM": [], "PM": []})
+                        if kind not in slot[period]:
+                            slot[period].append(kind)
+
+
+@app.post("/parse-requirements")
+async def parse_requirements(
+    ok_file:  UploadFile = File(None),
+    pbk_file: UploadFile = File(None),
+):
+    result: dict = {}
+    if ok_file  and ok_file.filename:
+        _extract(await ok_file.read(),  "OK",  result)
+    if pbk_file and pbk_file.filename:
+        _extract(await pbk_file.read(), "PBK", result)
+
+    count = sum(
+        len(v.get("AM", [])) + len(v.get("PM", []))
+        for v in result.values()
+    )
+    return {"requirements": result, "count": count}
 
 
 @app.post("/solve-weekday")
