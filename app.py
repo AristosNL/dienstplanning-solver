@@ -63,7 +63,7 @@ _DAYS_NL = {"MAANDAG", "DINSDAG", "WOENSDAG", "DONDERDAG", "VRIJDAG"}
 _WEEK_COLS = [(2, 2, 3), (4, 4, 5), (6, 6, 7), (8, 8, 9)]
 
 
-def _extract(content: bytes, kind: str, result: dict):
+def _extract(content: bytes, kind: str, result: dict, min_date: str | None = None):
     """Parseer één Excel-bestand en voeg geldige PLA-requirements toe aan result."""
     wb_v = openpyxl.load_workbook(BytesIO(content), data_only=True)
     wb_f = openpyxl.load_workbook(BytesIO(content), data_only=False)
@@ -92,6 +92,8 @@ def _extract(content: bytes, kind: str, result: dict):
                 if not isinstance(dval, dt):
                     continue
                 date_str = dval.strftime("%Y-%m-%d")
+                if min_date and date_str < min_date:
+                    continue   # verleden week — negeren
 
                 for (col, period) in [(oc, "AM"), (mc, "PM")]:
                     for br in block:
@@ -111,6 +113,7 @@ def _extract(content: bytes, kind: str, result: dict):
 
 class DagDoctorIn(BaseModel):
     id: str
+    role:        str = "dokter"
     activityIds: list[str] = []
     fixedOff:    list[str] = []
     preferOff:   list[str] = []
@@ -120,19 +123,40 @@ class DagDoctorIn(BaseModel):
 class DagplanningReqBody(BaseModel):
     requirements: dict                              # { "2026-01-05": { "AM": ["OK"], "PM": ["PBK"] } }
     doctors:      list[DagDoctorIn]
-    reqActMap:    dict = {"OK": "act_ok", "PBK": "act_pbk"}
+    reqActMap:    dict = {"OK": "act_ok", "PBK": "act_pbk", "Poli": "act_poli"}
+
+
+def _doctor_available(doc: DagDoctorIn, date_str: str) -> bool:
+    """Een arts is beschikbaar op een dagdeel als hij niet vrij is en niet afwezig."""
+    wd = WD_CODES[date.fromisoformat(date_str).weekday()]
+    if wd in doc.fixedOff:
+        return False
+    for ab in doc.absences:
+        f, t = ab.get("from"), ab.get("to")
+        if f and t and f <= date_str <= t:
+            return False
+    return True
 
 
 @app.post("/solve-dagplanning")
 def solve_dagplanning(req: DagplanningReqBody):
     """
-    Koppelt artsen aan OK/PBK-vereisten via CP-SAT (partial_coverage=True):
-    - Hard: beschikbaarheid (fixedOff, absences), niet dubbel in zelfde dagdeel
-    - Soft: dekking maximaliseren (hoge straf per ongedekt slot), fairness
-    Retourneert per slot-sleutel (<date>__<period>__<type>) de toegewezen arts-id.
+    Volledige arts-planningsketen per dagdeel:
+      beschikbaar = #artsen(rol=dokter) - #vrij - #scholing
+      1. Vul OK + PBK uit beschikbaar. Bij tekort: PBK eerst teruggeven, dan OK.
+      2. Poli = beschikbaar - (OK + PBK die overeind blijven).
+      3. CP-SAT verdeelt de overeind gebleven OK/PBK/Poli eerlijk over de artsen.
+    Retourneert toewijzingen + teruggeef-lijst (returned) + poli-vereisten.
     """
+    doctors    = [d for d in req.doctors if d.role in ("dokter", "arts")]
+    ok_act     = req.reqActMap.get("OK",   "act_ok")
+    pbk_act    = req.reqActMap.get("PBK",  "act_pbk")
+    poli_act   = req.reqActMap.get("Poli", "act_poli")
+
     monday_idx: dict[date, int] = {}
-    slots = []
+    slots: list[Slot] = []
+    returned: list[dict] = []          # teruggegeven OK/PBK door tekort
+    poli_added: dict[str, dict] = {}   # { date: { AM: n, PM: n } } voor terugkoppeling UI
 
     for date_str in sorted(req.requirements):
         d = date.fromisoformat(date_str)
@@ -143,47 +167,76 @@ def solve_dagplanning(req: DagplanningReqBody):
         seq = d.weekday()
 
         for period_str in ["AM", "PM"]:
-            for req_type in req.requirements[date_str].get(period_str, []):
-                act_id = req.reqActMap.get(req_type)
-                if not act_id:
-                    continue
-                period_enum = Period.AM if period_str == "AM" else Period.PM
-                slots.append(Slot(
-                    id=f"{date_str}__{period_str}__{req_type}",
-                    date=date_str,
-                    period=period_enum,
-                    required_skill=act_id,
-                    demand=1,
-                    week=wk,
-                    seq=wk * 10 + seq,
-                ))
+            period_enum = Period.AM if period_str == "AM" else Period.PM
+            reqs = req.requirements[date_str].get(period_str, [])
+            n_ok  = reqs.count("OK")
+            n_pbk = reqs.count("PBK")
+
+            # beschikbare artsen dit dagdeel
+            avail_n = sum(1 for doc in doctors if _doctor_available(doc, date_str))
+
+            # 1. OK + PBK passend maken op beschikbaar; PBK eerst teruggeven
+            keep_ok, keep_pbk = n_ok, n_pbk
+            while keep_ok + keep_pbk > avail_n:
+                if keep_pbk > 0:
+                    keep_pbk -= 1
+                    returned.append({"date": date_str, "period": period_str, "type": "PBK"})
+                elif keep_ok > 0:
+                    keep_ok -= 1
+                    returned.append({"date": date_str, "period": period_str, "type": "OK"})
+                else:
+                    break
+
+            # 2. Poli = rest van de beschikbare artsen
+            n_poli = max(0, avail_n - keep_ok - keep_pbk)
+            if n_poli > 0:
+                poli_added.setdefault(date_str, {})[period_str] = n_poli
+
+            # 3. slots bouwen (index per type voor unieke id's)
+            def _add(act_id, label, count):
+                for i in range(count):
+                    slots.append(Slot(
+                        id=f"{date_str}__{period_str}__{label}__{i}",
+                        date=date_str, period=period_enum,
+                        required_skill=act_id, demand=1,
+                        week=wk, seq=wk * 10 + seq,
+                    ))
+            _add(ok_act,   "OK",   keep_ok)
+            _add(pbk_act,  "PBK",  keep_pbk)
+            _add(poli_act, "Poli", n_poli)
 
     if not slots:
         return {"feasible": True, "assignments": {}, "unassigned": [],
-                "stats": {"total": 0, "assigned": 0, "unassigned": 0}}
+                "returned": returned, "poli": poli_added,
+                "stats": {"total": 0, "assigned": 0, "unassigned": 0, "returned": len(returned)}}
 
     staff_list = [
-        Staff(id=d.id, name=d.id, role="dokter",
-              skills=frozenset(d.activityIds), carry_in=0)
-        for d in req.doctors
+        Staff(id=doc.id, name=doc.id, role="dokter",
+              skills=frozenset(doc.activityIds | {ok_act, pbk_act, poli_act}
+                               if isinstance(doc.activityIds, set) else
+                               set(doc.activityIds) | {ok_act, pbk_act, poli_act}),
+              carry_in=0)
+        for doc in doctors
     ]
+    # let op: elke arts mag OK/PBK/Poli draaien (alle drie zijn arts-activiteiten);
+    # koppeling beperkt alleen wie OK/PBK uit Excel mag, niet de poli-vulling.
 
     avail: dict[tuple[str, str], Avail] = {}
-    for doc in req.doctors:
-        for slot in slots:
-            wd = WD_CODES[date.fromisoformat(slot.date).weekday()]
+    for doc in doctors:
+        for date_str in {s.date for s in slots}:
+            wd = WD_CODES[date.fromisoformat(date_str).weekday()]
             if wd in doc.fixedOff:
-                avail[(doc.id, slot.date)] = Avail.MANDATORY_OFF
+                avail[(doc.id, date_str)] = Avail.MANDATORY_OFF
             elif wd in doc.preferOff:
-                avail.setdefault((doc.id, slot.date), Avail.PREFER_OFF)
+                avail.setdefault((doc.id, date_str), Avail.PREFER_OFF)
         for ab in doc.absences:
             f, t = ab.get("from"), ab.get("to")
             if not (f and t):
                 continue
             kind = Avail.COURSE if ab.get("type") == "cursus" else Avail.VACATION
-            for slot in slots:
-                if f <= slot.date <= t:
-                    avail[(doc.id, slot.date)] = kind
+            for date_str in {s.date for s in slots}:
+                if f <= date_str <= t:
+                    avail[(doc.id, date_str)] = kind
 
     weights = SoftWeights(fairness=10, continuity=0, prefer_off=1)
     engine  = RosterEngine(staff_list, slots, avail, weights, partial_coverage=True)
@@ -198,12 +251,16 @@ def solve_dagplanning(req: DagplanningReqBody):
         else:
             unassigned.append(slot.id)
 
-    total = len(slots)
     return {
         "feasible":    len(unassigned) == 0,
-        "assignments": assignments,
+        "assignments": assignments,    # "<date>__<period>__<type>__<i>" -> staffId
         "unassigned":  unassigned,
-        "stats":       {"total": total, "assigned": len(assignments), "unassigned": len(unassigned)},
+        "returned":    returned,       # [{date, period, type}]
+        "poli":        poli_added,     # {date: {AM:n, PM:n}}
+        "stats": {
+            "total": len(slots), "assigned": len(assignments),
+            "unassigned": len(unassigned), "returned": len(returned),
+        },
     }
 
 
@@ -213,10 +270,13 @@ async def parse_requirements(
     pbk_file: UploadFile = File(None),
 ):
     result: dict = {}
+    # alleen huidige + toekomstige weken: ondergrens = maandag van deze week
+    today_d  = date.today()
+    min_date = (today_d - timedelta(days=today_d.weekday())).isoformat()
     if ok_file  and ok_file.filename:
-        _extract(await ok_file.read(),  "OK",  result)
+        _extract(await ok_file.read(),  "OK",  result, min_date)
     if pbk_file and pbk_file.filename:
-        _extract(await pbk_file.read(), "PBK", result)
+        _extract(await pbk_file.read(), "PBK", result, min_date)
 
     count = sum(
         len(v.get("AM", [])) + len(v.get("PM", []))
