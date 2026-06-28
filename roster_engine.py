@@ -60,6 +60,8 @@ class SoftWeights:
     fairness: int = 10
     continuity: int = 3
     prefer_off: int = 1
+    same_day_pair: int = 0   # regel 1: AM+PM van zelfde skill -> liefst zelfde persoon
+    poli_split: int = 0      # regel 2: niemand Poli in AM en PM op dezelfde dag
 
 
 @dataclass
@@ -77,12 +79,16 @@ class RosterEngine:
     def __init__(self, staff: list[Staff], slots: list[Slot],
                  availability: dict[tuple[str, str], Avail],
                  weights: SoftWeights | None = None,
-                 partial_coverage: bool = False):
+                 partial_coverage: bool = False,
+                 pair_skill: str | None = None,
+                 split_skill: str | None = None):
         self.staff = staff
         self.slots = slots
         self.availability = availability
         self.w = weights or SoftWeights()
         self.partial_coverage = partial_coverage
+        self.pair_skill = pair_skill      # skill waarvoor AM+PM zelfde persoon (regel 1)
+        self.split_skill = split_skill    # skill die niet AM+PM bij één persoon mag (regel 2)
         self.m = cp_model.CpModel()
         self.x: dict[tuple[str, str], cp_model.IntVar] = {}
         self.penalties: list[cp_model.LinearExpr] = []
@@ -108,6 +114,8 @@ class RosterEngine:
         self._fairness()
         self._continuity()
         self._prefer_off()
+        self._same_day_pair()
+        self._poli_split()
         self.m.Minimize(sum(self.penalties))
 
     # ---- HARD/SOFT: elk slot krijgt (demand) mensen -------------------------
@@ -198,6 +206,59 @@ class RosterEngine:
                 if (s.id, slot.id) in self.x:
                     if self.availability.get((s.id, slot.date)) == Avail.PREFER_OFF:
                         self.penalties.append(self.w.prefer_off * self.x[(s.id, slot.id)])
+
+    # ---- ZACHT regel 1: OK in AM en PM op dezelfde dag = dezelfde persoon ----
+    def _same_day_pair(self):
+        if self.w.same_day_pair <= 0 or not self.pair_skill:
+            return
+        # groepeer slots van pair_skill per datum
+        by_date: dict[str, dict[Period, Slot]] = {}
+        for slot in self.slots:
+            if slot.required_skill == self.pair_skill:
+                by_date.setdefault(slot.date, {})[slot.period] = slot
+        for date, periods in by_date.items():
+            am, pm = periods.get(Period.AM), periods.get(Period.PM)
+            if not (am and pm):
+                continue
+            # straf als arts s WEL am doet maar NIET pm (en omgekeerd)
+            for s in self.staff:
+                xa = self.x.get((s.id, am.id))
+                xp = self.x.get((s.id, pm.id))
+                if xa is None or xp is None:
+                    continue
+                diff = self.m.NewBoolVar(f"okdiff_{s.id}_{date}")
+                # diff >= xa - xp  en  diff >= xp - xa  → diff=1 als ze verschillen
+                self.m.Add(diff >= xa - xp)
+                self.m.Add(diff >= xp - xa)
+                self.penalties.append(self.w.same_day_pair * diff)
+
+    # ---- ZACHT regel 2: niemand Poli in AM EN PM op dezelfde dag -------------
+    def _poli_split(self):
+        if self.w.poli_split <= 0 or not self.split_skill:
+            return
+        by_date: dict[str, dict[Period, list]] = {}
+        for slot in self.slots:
+            if slot.required_skill == self.split_skill:
+                by_date.setdefault(slot.date, {}).setdefault(slot.period, []).append(slot)
+        for date, periods in by_date.items():
+            am_slots = periods.get(Period.AM, [])
+            pm_slots = periods.get(Period.PM, [])
+            if not (am_slots and pm_slots):
+                continue
+            for s in self.staff:
+                am_vars = [self.x[(s.id, sl.id)] for sl in am_slots if (s.id, sl.id) in self.x]
+                pm_vars = [self.x[(s.id, sl.id)] for sl in pm_slots if (s.id, sl.id) in self.x]
+                if not (am_vars and pm_vars):
+                    continue
+                has_am = self.m.NewBoolVar(f"poliam_{s.id}_{date}")
+                has_pm = self.m.NewBoolVar(f"polipm_{s.id}_{date}")
+                self.m.AddMaxEquality(has_am, am_vars)
+                self.m.AddMaxEquality(has_pm, pm_vars)
+                both = self.m.NewBoolVar(f"poliboth_{s.id}_{date}")
+                # both = has_am AND has_pm
+                self.m.AddBoolAnd([has_am, has_pm]).OnlyEnforceIf(both)
+                self.m.AddBoolOr([has_am.Not(), has_pm.Not()]).OnlyEnforceIf(both.Not())
+                self.penalties.append(self.w.poli_split * both)
 
     def solve(self, max_seconds: float = 10.0) -> Result:
         self.build()

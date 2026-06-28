@@ -59,8 +59,9 @@ def health():
 # ---------------------------------------------------------------------------
 
 _DAYS_NL = {"MAANDAG", "DINSDAG", "WOENSDAG", "DONDERDAG", "VRIJDAG"}
-# Per dag-blok: (datum_kol, ochtend_kol, middag_kol) voor weken 1-4
-_WEEK_COLS = [(2, 2, 3), (4, 4, 5), (6, 6, 7), (8, 8, 9)]
+# Per dag-blok: (datum_kol, ochtend_kol, middag_kol) voor weken 1-5
+# Sommige maanden hebben 5 voorkomens van een weekdag (bv. juni heeft 5 woensdagen)
+_WEEK_COLS = [(2, 2, 3), (4, 4, 5), (6, 6, 7), (8, 8, 9), (10, 10, 11)]
 
 
 def _extract(content: bytes, kind: str, result: dict, min_date: str | None = None):
@@ -124,6 +125,7 @@ class DagplanningReqBody(BaseModel):
     requirements: dict                              # { "2026-01-05": { "AM": ["OK"], "PM": ["PBK"] } }
     doctors:      list[DagDoctorIn]
     reqActMap:    dict = {"OK": "act_ok", "PBK": "act_pbk", "Poli": "act_poli"}
+    priorTotals:  dict = {}                         # { staffId: aantal reeds geplande slots dit jaar } (regel 3)
 
 
 def _doctor_available(doc: DagDoctorIn, date_str: str) -> bool:
@@ -212,10 +214,8 @@ def solve_dagplanning(req: DagplanningReqBody):
 
     staff_list = [
         Staff(id=doc.id, name=doc.id, role="dokter",
-              skills=frozenset(doc.activityIds | {ok_act, pbk_act, poli_act}
-                               if isinstance(doc.activityIds, set) else
-                               set(doc.activityIds) | {ok_act, pbk_act, poli_act}),
-              carry_in=0)
+              skills=frozenset(set(doc.activityIds) | {ok_act, pbk_act, poli_act}),
+              carry_in=int(req.priorTotals.get(doc.id, 0)))   # regel 3: jaar-saldo als startstand
         for doc in doctors
     ]
     # let op: elke arts mag OK/PBK/Poli draaien (alle drie zijn arts-activiteiten);
@@ -238,8 +238,13 @@ def solve_dagplanning(req: DagplanningReqBody):
                 if f <= date_str <= t:
                     avail[(doc.id, date_str)] = kind
 
-    weights = SoftWeights(fairness=10, continuity=0, prefer_off=1)
-    engine  = RosterEngine(staff_list, slots, avail, weights, partial_coverage=True)
+    weights = SoftWeights(
+        fairness=10, continuity=0, prefer_off=1,
+        same_day_pair=15,  # regel 1: OK AM+PM zelfde persoon (> fairness, dwingt koppeling)
+        poli_split=4,      # regel 2: niet 2× Poli op één dag (zacht, wijkt voor fairness/regel 1)
+    )
+    engine  = RosterEngine(staff_list, slots, avail, weights, partial_coverage=True,
+                           pair_skill=ok_act, split_skill=poli_act)
     res     = engine.solve(max_seconds=30.0)
 
     assignments: dict[str, str] = {}
