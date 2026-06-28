@@ -72,14 +72,17 @@ class Result:
 
 
 class RosterEngine:
+    UNCOV_PENALTY = 1000   # straf per ongedekt slot bij partial_coverage
+
     def __init__(self, staff: list[Staff], slots: list[Slot],
                  availability: dict[tuple[str, str], Avail],
-                 weights: SoftWeights | None = None):
+                 weights: SoftWeights | None = None,
+                 partial_coverage: bool = False):
         self.staff = staff
         self.slots = slots
-        # availability key = (staff_id, date) -> status; ontbreekt = AVAILABLE
         self.availability = availability
         self.w = weights or SoftWeights()
+        self.partial_coverage = partial_coverage
         self.m = cp_model.CpModel()
         self.x: dict[tuple[str, str], cp_model.IntVar] = {}
         self.penalties: list[cp_model.LinearExpr] = []
@@ -107,13 +110,22 @@ class RosterEngine:
         self._prefer_off()
         self.m.Minimize(sum(self.penalties))
 
-    # ---- HARD: elk slot krijgt precies (demand) mensen -----------------------
+    # ---- HARD/SOFT: elk slot krijgt (demand) mensen -------------------------
     def _coverage(self):
         for slot in self.slots:
             vars_ = [self.x[(s.id, slot.id)] for s in self.staff
                      if (s.id, slot.id) in self.x]
-            # exact demand; bij infeasibility meldt de solver dat (ondergedekt)
-            self.m.Add(sum(vars_) == slot.demand)
+            if not vars_:
+                continue          # geen kandidaten: onoplosbaar, skip
+            if self.partial_coverage:
+                # Soft: probeer demand te halen, straf elk tekort zwaar
+                self.m.Add(sum(vars_) <= slot.demand)
+                shortfall = self.m.NewIntVar(0, slot.demand, f"short_{slot.id}")
+                self.m.Add(shortfall == slot.demand - sum(vars_))
+                self.penalties.append(self.UNCOV_PENALTY * shortfall)
+            else:
+                # Hard: exact demand (klassieker gedrag)
+                self.m.Add(sum(vars_) == slot.demand)
 
     # ---- HARD: niemand twee slots op hetzelfde dagdeel -----------------------
     def _one_slot_per_period(self):

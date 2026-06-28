@@ -109,6 +109,104 @@ def _extract(content: bytes, kind: str, result: dict):
                             slot[period].append(kind)
 
 
+class DagDoctorIn(BaseModel):
+    id: str
+    activityIds: list[str] = []
+    fixedOff:    list[str] = []
+    preferOff:   list[str] = []
+    absences:    list[dict] = []
+
+
+class DagplanningReqBody(BaseModel):
+    requirements: dict                              # { "2026-01-05": { "AM": ["OK"], "PM": ["PBK"] } }
+    doctors:      list[DagDoctorIn]
+    reqActMap:    dict = {"OK": "act_ok", "PBK": "act_pbk"}
+
+
+@app.post("/solve-dagplanning")
+def solve_dagplanning(req: DagplanningReqBody):
+    """
+    Koppelt artsen aan OK/PBK-vereisten via CP-SAT (partial_coverage=True):
+    - Hard: beschikbaarheid (fixedOff, absences), niet dubbel in zelfde dagdeel
+    - Soft: dekking maximaliseren (hoge straf per ongedekt slot), fairness
+    Retourneert per slot-sleutel (<date>__<period>__<type>) de toegewezen arts-id.
+    """
+    monday_idx: dict[date, int] = {}
+    slots = []
+
+    for date_str in sorted(req.requirements):
+        d = date.fromisoformat(date_str)
+        monday = d - timedelta(days=d.weekday())
+        if monday not in monday_idx:
+            monday_idx[monday] = len(monday_idx)
+        wk  = monday_idx[monday]
+        seq = d.weekday()
+
+        for period_str in ["AM", "PM"]:
+            for req_type in req.requirements[date_str].get(period_str, []):
+                act_id = req.reqActMap.get(req_type)
+                if not act_id:
+                    continue
+                period_enum = Period.AM if period_str == "AM" else Period.PM
+                slots.append(Slot(
+                    id=f"{date_str}__{period_str}__{req_type}",
+                    date=date_str,
+                    period=period_enum,
+                    required_skill=act_id,
+                    demand=1,
+                    week=wk,
+                    seq=wk * 10 + seq,
+                ))
+
+    if not slots:
+        return {"feasible": True, "assignments": {}, "unassigned": [],
+                "stats": {"total": 0, "assigned": 0, "unassigned": 0}}
+
+    staff_list = [
+        Staff(id=d.id, name=d.id, role="dokter",
+              skills=frozenset(d.activityIds), carry_in=0)
+        for d in req.doctors
+    ]
+
+    avail: dict[tuple[str, str], Avail] = {}
+    for doc in req.doctors:
+        for slot in slots:
+            wd = WD_CODES[date.fromisoformat(slot.date).weekday()]
+            if wd in doc.fixedOff:
+                avail[(doc.id, slot.date)] = Avail.MANDATORY_OFF
+            elif wd in doc.preferOff:
+                avail.setdefault((doc.id, slot.date), Avail.PREFER_OFF)
+        for ab in doc.absences:
+            f, t = ab.get("from"), ab.get("to")
+            if not (f and t):
+                continue
+            kind = Avail.COURSE if ab.get("type") == "cursus" else Avail.VACATION
+            for slot in slots:
+                if f <= slot.date <= t:
+                    avail[(doc.id, slot.date)] = kind
+
+    weights = SoftWeights(fairness=10, continuity=0, prefer_off=1)
+    engine  = RosterEngine(staff_list, slots, avail, weights, partial_coverage=True)
+    res     = engine.solve(max_seconds=30.0)
+
+    assignments: dict[str, str] = {}
+    unassigned:  list[str]      = []
+    for slot in slots:
+        who = res.assignments.get(slot.id, [])
+        if who:
+            assignments[slot.id] = who[0]
+        else:
+            unassigned.append(slot.id)
+
+    total = len(slots)
+    return {
+        "feasible":    len(unassigned) == 0,
+        "assignments": assignments,
+        "unassigned":  unassigned,
+        "stats":       {"total": total, "assigned": len(assignments), "unassigned": len(unassigned)},
+    }
+
+
 @app.post("/parse-requirements")
 async def parse_requirements(
     ok_file:  UploadFile = File(None),
