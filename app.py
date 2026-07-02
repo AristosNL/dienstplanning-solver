@@ -36,6 +36,7 @@ class DoctorIn(BaseModel):
     carryIn: int = 0
     fixedOff: list[str] = []          # weekdagcodes, bv. ["wo"]
     preferOff: list[str] = []         # weekdagcodes, zacht
+    biweeklyOff: list[dict] = []      # [{"day":"wo","parity":"even"|"oneven"}] — hard, ISO-weekpariteit
     absences: list[dict] = []         # [{"from":"2026-07-06","to":"2026-07-10","type":"vakantie"}]
 
 
@@ -58,6 +59,8 @@ def health():
 # Structuur retour: { requirements: { "2026-01-05": { "AM": ["OK"], "PM": [] } } }
 # ---------------------------------------------------------------------------
 
+import re as _re
+_PLA_RE  = _re.compile(r'^PLA(\s|>|\(|-|$)', _re.IGNORECASE)
 _DAYS_NL = {"MAANDAG", "DINSDAG", "WOENSDAG", "DONDERDAG", "VRIJDAG"}
 # Per dag-blok: (datum_kol, ochtend_kol, middag_kol) voor weken 1-5
 # Sommige maanden hebben 5 voorkomens van een weekdag (bv. juni heeft 5 woensdagen)
@@ -99,7 +102,7 @@ def _extract(content: bytes, kind: str, result: dict, min_date: str | None = Non
                 for (col, period) in [(oc, "AM"), (mc, "PM")]:
                     for br in block:
                         v = wsv.cell(br, col).value
-                        if not (v and "PLA" in str(v).upper()):
+                        if not (v and _PLA_RE.match(str(v).strip())):
                             continue
                         cell_f = wsf.cell(br, col)
                         struck = bool(cell_f.font and cell_f.font.strikethrough)
@@ -118,7 +121,17 @@ class DagDoctorIn(BaseModel):
     activityIds: list[str] = []
     fixedOff:    list[str] = []
     preferOff:   list[str] = []
+    biweeklyOff: list[dict] = []      # [{"day":"wo","parity":"even"|"oneven"}]
     absences:    list[dict] = []
+
+
+def _is_biweekly_off(rules: list[dict], date_str: str, wd: str) -> bool:
+    """'Om de week vrij' — hard, alleen op even/oneven ISO-weken (isocalendar,
+    zelfde algoritme als de frontend's isoWeek())."""
+    if not rules:
+        return False
+    parity = "even" if date.fromisoformat(date_str).isocalendar()[1] % 2 == 0 else "oneven"
+    return any(r.get("day") == wd and r.get("parity") == parity for r in rules)
 
 
 class DagplanningReqBody(BaseModel):
@@ -132,6 +145,8 @@ def _doctor_available(doc: DagDoctorIn, date_str: str) -> bool:
     """Een arts is beschikbaar op een dagdeel als hij niet vrij is en niet afwezig."""
     wd = WD_CODES[date.fromisoformat(date_str).weekday()]
     if wd in doc.fixedOff:
+        return False
+    if _is_biweekly_off(doc.biweeklyOff, date_str, wd):
         return False
     for ab in doc.absences:
         f, t = ab.get("from"), ab.get("to")
@@ -225,7 +240,7 @@ def solve_dagplanning(req: DagplanningReqBody):
     for doc in doctors:
         for date_str in {s.date for s in slots}:
             wd = WD_CODES[date.fromisoformat(date_str).weekday()]
-            if wd in doc.fixedOff:
+            if wd in doc.fixedOff or _is_biweekly_off(doc.biweeklyOff, date_str, wd):
                 avail[(doc.id, date_str)] = Avail.MANDATORY_OFF
             elif wd in doc.preferOff:
                 avail.setdefault((doc.id, date_str), Avail.PREFER_OFF)
@@ -314,7 +329,7 @@ def solve_weekday(req: SolveReq):
                            skills=frozenset({SKILL}), carry_in=doc.carryIn))
         for slot in slots:
             wd = WD_CODES[date.fromisoformat(slot.date).weekday()]
-            if wd in doc.fixedOff:
+            if wd in doc.fixedOff or _is_biweekly_off(doc.biweeklyOff, slot.date, wd):
                 avail[(doc.id, slot.date)] = Avail.MANDATORY_OFF
             elif wd in doc.preferOff:
                 avail.setdefault((doc.id, slot.date), Avail.PREFER_OFF)
