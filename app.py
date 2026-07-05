@@ -122,6 +122,7 @@ class DagDoctorIn(BaseModel):
     fixedOff:    list[str] = []
     preferOff:   list[str] = []
     biweeklyOff: list[dict] = []      # [{"day":"wo","parity":"even"|"oneven"}]
+    manualOff:   list[dict] = []      # [{"date":"2026-07-06","period":"AM"}] — VRIJ-cel, hard per dagdeel
     absences:    list[dict] = []
 
 
@@ -141,13 +142,16 @@ class DagplanningReqBody(BaseModel):
     priorTotals:  dict = {}                         # { staffId: aantal reeds geplande slots dit jaar } (regel 3)
 
 
-def _doctor_available(doc: DagDoctorIn, date_str: str) -> bool:
+def _doctor_available(doc: DagDoctorIn, date_str: str, period: str | None = None) -> bool:
     """Een arts is beschikbaar op een dagdeel als hij niet vrij is en niet afwezig."""
     wd = WD_CODES[date.fromisoformat(date_str).weekday()]
     if wd in doc.fixedOff:
         return False
     if _is_biweekly_off(doc.biweeklyOff, date_str, wd):
         return False
+    for mo in doc.manualOff:                      # handmatige/auto VRIJ-cel = hard vrij
+        if mo.get("date") == date_str and (period is None or mo.get("period") == period):
+            return False
     for ab in doc.absences:
         f, t = ab.get("from"), ab.get("to")
         if f and t and f <= date_str <= t:
@@ -190,7 +194,7 @@ def solve_dagplanning(req: DagplanningReqBody):
             n_pbk = reqs.count("PBK")
 
             # beschikbare artsen dit dagdeel
-            avail_n = sum(1 for doc in doctors if _doctor_available(doc, date_str))
+            avail_n = sum(1 for doc in doctors if _doctor_available(doc, date_str, period_str))
 
             # 1. OK + PBK passend maken op beschikbaar; PBK eerst teruggeven
             keep_ok, keep_pbk = n_ok, n_pbk
@@ -238,9 +242,10 @@ def solve_dagplanning(req: DagplanningReqBody):
 
     avail: dict[tuple[str, str], Avail] = {}
     for doc in doctors:
+        mo_dates = {mo.get("date") for mo in doc.manualOff}
         for date_str in {s.date for s in slots}:
             wd = WD_CODES[date.fromisoformat(date_str).weekday()]
-            if wd in doc.fixedOff or _is_biweekly_off(doc.biweeklyOff, date_str, wd):
+            if wd in doc.fixedOff or _is_biweekly_off(doc.biweeklyOff, date_str, wd) or date_str in mo_dates:
                 avail[(doc.id, date_str)] = Avail.MANDATORY_OFF
             elif wd in doc.preferOff:
                 avail.setdefault((doc.id, date_str), Avail.PREFER_OFF)
@@ -257,6 +262,8 @@ def solve_dagplanning(req: DagplanningReqBody):
         fairness=10, continuity=0, prefer_off=1,
         same_day_pair=15,  # regel 1: OK AM+PM zelfde persoon (> fairness, dwingt koppeling)
         poli_split=4,      # regel 2: niet 2× Poli op één dag (zacht, wijkt voor fairness/regel 1)
+        ok_fairness=12,    # binnen-week OK-verdeling (> jaar-fairness, < koppeling)
+        ok_skill=ok_act,
     )
     engine  = RosterEngine(staff_list, slots, avail, weights, partial_coverage=True,
                            pair_skill=ok_act, split_skill=poli_act)

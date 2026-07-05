@@ -62,6 +62,8 @@ class SoftWeights:
     prefer_off: int = 1
     same_day_pair: int = 0   # regel 1: AM+PM van zelfde skill -> liefst zelfde persoon
     poli_split: int = 0      # regel 2: niemand Poli in AM en PM op dezelfde dag
+    ok_fairness: int = 0     # regel: OK-diensten apart eerlijk verdelen binnen de week
+    ok_skill: str = ""       # welke required_skill telt als "OK" voor ok_fairness
 
 
 @dataclass
@@ -112,6 +114,7 @@ class RosterEngine:
         self._coverage()
         self._one_slot_per_period()
         self._fairness()
+        self._ok_fairness()
         self._continuity()
         self._prefer_off()
         self._same_day_pair()
@@ -166,6 +169,34 @@ class RosterEngine:
         self.m.Add(spread == hi - lo)
         self.penalties.append(self.w.fairness * spread)
         self._totals = totals
+
+    def _ok_fairness(self):
+        """Verdeel specifiek de OK-slots zo gelijk mogelijk binnen de week.
+        Los van de algemene fairness (die telt alle types samen, waardoor
+        veel Poli een scheve OK-verdeling kan maskeren)."""
+        if self.w.ok_fairness <= 0 or not self.w.ok_skill:
+            return
+        ok_slots = [s for s in self.slots if s.required_skill == self.w.ok_skill]
+        if not ok_slots:
+            return
+        totals = []
+        for s in self.staff:
+            assigned = [self.x[(s.id, slot.id)] for slot in ok_slots
+                        if (s.id, slot.id) in self.x]
+            if not assigned:
+                continue
+            t = self.m.NewIntVar(0, len(ok_slots), f"oktot_{s.id}")
+            self.m.Add(t == sum(assigned))
+            totals.append(t)
+        if len(totals) < 2:
+            return
+        lo = self.m.NewIntVar(0, 10**6, "ok_min")
+        hi = self.m.NewIntVar(0, 10**6, "ok_max")
+        self.m.AddMinEquality(lo, totals)
+        self.m.AddMaxEquality(hi, totals)
+        spread = self.m.NewIntVar(0, 10**6, "ok_spread")
+        self.m.Add(spread == hi - lo)
+        self.penalties.append(self.w.ok_fairness * spread)
 
     # ---- ZACHT: continuiteit binnen de week (zo min mogelijk wisselingen) ----
     def _continuity(self):
