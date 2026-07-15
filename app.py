@@ -370,3 +370,92 @@ def solve_weekday(req: SolveReq):
         "feasible": True, "status": res.status,
         "assignments": assignments, "totals": res.totals, "objective": res.objective,
     }
+
+
+# ────────────────────────────────────────────────────────────────
+# ASSISTENTEN — VOORBEREIDING (nog geen business rules, niet aangeroepen
+# vanuit de frontend). Zelfde infra als /solve-dagplanning: fixedOff,
+# preferOff, biweeklyOff, manualOff (VRIJ-cel) en absences werken al hard
+# zoals bij artsen. Coverage + algemene fairness + voorkeur-vrij staan aan;
+# same_day_pair/poli_split staan uit totdat bekend is welke assistent-
+# specifieke koppelingen/regels gelden (bijv. "activiteit X+Y altijd
+# dezelfde persoon", "nooit twee weken op rij dezelfde taak", etc.).
+# Zet business rules → activeer de bijbehorende SoftWeight hieronder.
+# ────────────────────────────────────────────────────────────────
+
+class AssistentIn(BaseModel):
+    id: str
+    activityIds: list[str] = []
+    fixedOff:    list[str] = []
+    preferOff:   list[str] = []
+    biweeklyOff: list[dict] = []
+    manualOff:   list[dict] = []
+    absences:    list[dict] = []
+
+
+class AssistentenReqBody(BaseModel):
+    requirements: dict     # zelfde vorm als dagplanning: {"2026-01-05": {"AM": ["<activiteit>"], "PM": [...]}}
+    assistenten:  list[AssistentIn]
+    reqActMap:    dict = {}          # vul in zodra bekend welke labels -> welke activity-id's
+    priorTotals:  dict = {}          # optioneel: jaar-fairness-startstand, zelfde patroon als bij artsen
+
+
+@app.post("/solve-assistenten")
+def solve_assistenten(req: AssistentenReqBody):
+    """Skeleton — coverage + generieke fairness + voorkeur-vrij. Voeg
+    assistent-specifieke zachte/harde regels toe zodra bekend."""
+    slots: list[Slot] = []
+    for wk, date_str in enumerate(sorted(req.requirements)):
+        for period_str, reqs in req.requirements[date_str].items():
+            period_enum = Period.AM if period_str == "AM" else Period.PM
+            for i, label in enumerate(reqs):
+                act_id = req.reqActMap.get(label, label)
+                slots.append(Slot(id=f"{date_str}__{period_str}__{label}__{i}",
+                                   date=date_str, period=period_enum,
+                                   required_skill=act_id, demand=1, week=wk))
+
+    all_skills = {req.reqActMap.get(l, l) for d in req.requirements.values() for lst in d.values() for l in lst}
+    staff = [
+        Staff(id=a.id, name=a.id, role="assistent",
+              skills=frozenset(set(a.activityIds) | all_skills),  # TODO: verfijn zodra koppelingsregels bekend zijn
+              carry_in=req.priorTotals.get(a.id, 0))
+        for a in req.assistenten
+    ]
+
+    avail: dict[tuple[str, str], Avail] = {}
+    for a in req.assistenten:
+        mo_dates = {mo.get("date") for mo in a.manualOff}
+        for date_str in {s.date for s in slots}:
+            wd = WD_CODES[date.fromisoformat(date_str).weekday()]
+            if wd in a.fixedOff or _is_biweekly_off(a.biweeklyOff, date_str, wd) or date_str in mo_dates:
+                avail[(a.id, date_str)] = Avail.MANDATORY_OFF
+            elif wd in a.preferOff:
+                avail.setdefault((a.id, date_str), Avail.PREFER_OFF)
+        for ab in a.absences:
+            f, t_ = ab.get("from"), ab.get("to")
+            if not (f and t_):
+                continue
+            for date_str in {s.date for s in slots}:
+                if f <= date_str <= t_:
+                    avail[(a.id, date_str)] = Avail.MANDATORY_OFF
+
+    weights = SoftWeights(
+        fairness=10, continuity=0, prefer_off=1,
+        same_day_pair=0,   # TODO: activeren + ok_skill instellen zodra een koppelingsregel bekend is
+        poli_split=0,      # TODO: activeren zodra een "niet 2x op één dag"-regel bekend is
+    )
+
+    res = RosterEngine(staff, slots, avail, weights).solve()
+    if not res.feasible:
+        return {"feasible": False, "status": res.status, "assignments": {}, "totals": {}, "objective": 0}
+
+    assignments = {}
+    for slot in slots:
+        who = res.assignments.get(slot.id, [])
+        if who:
+            assignments[slot.id] = who[0]
+
+    return {
+        "feasible": True, "status": res.status,
+        "assignments": assignments, "totals": res.totals, "objective": res.objective,
+    }
