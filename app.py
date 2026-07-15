@@ -123,6 +123,7 @@ class DagDoctorIn(BaseModel):
     preferOff:   list[str] = []
     biweeklyOff: list[dict] = []      # [{"day":"wo","parity":"even"|"oneven"}]
     manualOff:   list[dict] = []      # [{"date":"2026-07-06","period":"AM"}] — VRIJ-cel, hard per dagdeel
+    availableOverride: list[dict] = []  # [{"date":"...","period":"AM"}] — negeert fixedOff/biweeklyOff voor deze datum
     absences:    list[dict] = []
 
 
@@ -142,13 +143,25 @@ class DagplanningReqBody(BaseModel):
     priorTotals:  dict = {}                         # { staffId: aantal reeds geplande slots dit jaar } (regel 3)
 
 
+def _has_override(doc: "DagDoctorIn", date_str: str, period: str | None) -> bool:
+    """True als de gebruiker deze normaal-vaste-vrije dag bewust heeft
+    vrijgegeven (freeDayOverrides in de frontend) — negeert dan fixedOff/
+    biweeklyOff voor precies deze datum/dagdeel. Absences blijven wel gelden."""
+    for ov in doc.availableOverride:
+        if ov.get("date") == date_str and (period is None or ov.get("period") == period):
+            return True
+    return False
+
+
 def _doctor_available(doc: DagDoctorIn, date_str: str, period: str | None = None) -> bool:
     """Een arts is beschikbaar op een dagdeel als hij niet vrij is en niet afwezig."""
     wd = WD_CODES[date.fromisoformat(date_str).weekday()]
-    if wd in doc.fixedOff:
-        return False
-    if _is_biweekly_off(doc.biweeklyOff, date_str, wd):
-        return False
+    override = _has_override(doc, date_str, period)
+    if not override:
+        if wd in doc.fixedOff:
+            return False
+        if _is_biweekly_off(doc.biweeklyOff, date_str, wd):
+            return False
     for mo in doc.manualOff:                      # handmatige/auto VRIJ-cel = hard vrij
         if mo.get("date") == date_str and (period is None or mo.get("period") == period):
             return False
@@ -243,9 +256,11 @@ def solve_dagplanning(req: DagplanningReqBody):
     avail: dict[tuple[str, str], Avail] = {}
     for doc in doctors:
         mo_dates = {mo.get("date") for mo in doc.manualOff}
+        ov_dates = {ov.get("date") for ov in doc.availableOverride}  # bewust vrijgegeven, negeert fixedOff/biweeklyOff
         for date_str in {s.date for s in slots}:
             wd = WD_CODES[date.fromisoformat(date_str).weekday()]
-            if wd in doc.fixedOff or _is_biweekly_off(doc.biweeklyOff, date_str, wd) or date_str in mo_dates:
+            fixed_blocks = (wd in doc.fixedOff or _is_biweekly_off(doc.biweeklyOff, date_str, wd)) and date_str not in ov_dates
+            if fixed_blocks or date_str in mo_dates:
                 avail[(doc.id, date_str)] = Avail.MANDATORY_OFF
             elif wd in doc.preferOff:
                 avail.setdefault((doc.id, date_str), Avail.PREFER_OFF)
